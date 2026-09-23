@@ -522,3 +522,114 @@ def test_metrics_id_path_validation(client):
     # 非整数 id 走 FastAPI 422；数字 0 是合法 int，查无此路径 -> 404
     assert client.post("/paths/x/metrics").status_code == 422
     assert client.post("/paths/0/metrics").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/scanlines 水平扫描线填充区间（只读）
+# ---------------------------------------------------------------------------
+
+def test_scanlines_basic_square(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/scanlines", json={"spacing": 2})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["spacing"] == 2.0
+    assert body["line_count"] == 5
+    # 从包围盒最小 y 起、最大 y 不含
+    assert [line["y"] for line in body["lines"]] == [0.0, 2.0, 4.0, 6.0, 8.0]
+    for line in body["lines"]:
+        assert line["intervals"] == [[0.0, 10.0]]
+    assert body["skipped_contours"] == []
+
+
+def test_scanlines_outer_hole_island(client):
+    # 外 0..10 / 孔 1..9 / 岛 6..8：按包含层级交替合并
+    pid = _mk(client, "M0,0h10v10h-10Z M1,1h8v8h-8Z M6,6h2v2h-2Z")
+    body = client.post(f"/paths/{pid}/scanlines", json={"spacing": 1}).json()
+    by_y = {line["y"]: line["intervals"] for line in body["lines"]}
+    assert by_y[7.0] == [[0.0, 1.0], [6.0, 8.0], [9.0, 10.0]]
+    assert by_y[1.0] == [[0.0, 1.0], [9.0, 10.0]]
+    # 区间升序、互不重叠
+    for line in body["lines"]:
+        xs = [x for iv in line["intervals"] for x in iv]
+        assert xs == sorted(xs)
+
+
+def test_scanlines_skips_open_and_degenerate(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10")
+    body = client.post(f"/paths/{pid}/scanlines", json={"spacing": 5}).json()
+    assert body["line_count"] == 2
+    assert body["lines"][0]["intervals"] == [[0.0, 10.0]]
+    reasons = {(s["original_index"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert reasons == {(1, "degenerate"), (2, "open")}
+
+
+def test_scanlines_empty_path_returns_empty_lines(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/scanlines", json={"spacing": 1}).json()
+    assert body["lines"] == []
+    assert body["line_count"] == 0
+    assert body["skipped_contours"] == []
+
+
+def test_scanlines_422_when_exceeding_1000_lines(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    # 间距 0.01 恰好 1000 条：允许
+    r = client.post(f"/paths/{pid}/scanlines", json={"spacing": 0.01})
+    assert r.status_code == 200, r.text
+    assert r.json()["line_count"] == 1000
+    # 间距 0.0001 -> 100000 条：超限返回 422
+    r = client.post(f"/paths/{pid}/scanlines", json={"spacing": 0.0001})
+    assert r.status_code == 422
+
+
+def test_scanlines_422_on_invalid_spacing(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/scanlines"
+    assert client.post(url, json={"spacing": 0}).status_code == 422
+    assert client.post(url, json={"spacing": -2}).status_code == 422
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"spacing": "x"}).status_code == 422
+    assert client.post(url, json={"spacing": "nan"}).status_code == 422
+    # 超大数（JSON 解析为 Infinity）也必须是 422 而不是 500
+    r = client.post(url,
+                    content='{"spacing": 1e999}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_scanlines_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/scanlines",
+                       json={"spacing": 2}).status_code == 200
+    # 只读：不产生规范化结果，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/scanlines", json={"spacing": 2}).json()
+    b2 = client.post(f"/paths/{pid}/scanlines", json={"spacing": 2}).json()
+    assert b1 == b2
+
+
+def test_scanlines_404(client):
+    assert client.post("/paths/999999/scanlines",
+                       json={"spacing": 1}).status_code == 404
+
+
+def test_scanlines_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/scanlines", json={"spacing": 1})
+    assert r.status_code == 422
+
+
+def test_scanlines_id_path_validation(client):
+    # 非整数 id 走 FastAPI 422；数字 0 是合法 int，查无此路径 -> 404
+    assert client.post("/paths/x/scanlines", json={"spacing": 1}).status_code == 422
+    assert client.post("/paths/0/scanlines", json={"spacing": 1}).status_code == 404

@@ -6,7 +6,10 @@
 对边界情况给出明确警告；另提供 **`POST /paths/{id}/metrics` 填充面积与面积质心分析**
 （按外环/孔洞/岛交替计入，曲线经细分多边形近似，只读不写库）、
 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
-（按细分线段计算任意两轮廓边界的最小欧氏距离）与 **`POST /paths/compare` 版本差异审计**，
+（按细分线段计算任意两轮廓边界的最小欧氏距离）、
+**`POST /paths/{id}/scanlines` 水平扫描线填充区间生成**
+（半开边求交、外/孔/岛交替合并，供逐行加工，只读不写库）与
+**`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
 
@@ -21,8 +24,9 @@
 │   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹 / 线段距离（零三方依赖）
 │   ├── metrics.py     # 填充面积与面积质心：外/孔/岛交替计入，基于细分多边形
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
+│   ├── scanlines.py   # 水平扫描线填充区间：半开边求交、外/孔/岛交替合并
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（104 个）
+├── tests/             # pytest 单元 + API 端到端测试（135 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -248,6 +252,67 @@ curl -s -X POST localhost:8000/paths/1/clearance \
 # -> conflict_count=1，b.role="open"，distance=1.0，hole_parent=false
 ```
 
+### `POST /paths/{id}/scanlines` — 水平扫描线填充区间（只读，供逐行加工）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写数据库**），从**有效闭合轮廓整体包围盒的最小 y** 起，每隔 `spacing`
+取一条水平扫描线（**最大 y 不含**），求每条线上属于填充区域的 x 区间：
+
+- 仅闭合且非退化轮廓（`outer` / `hole`）参与，**开放、退化轮廓跳过**
+  （出现在 `skipped_contours` 中）；
+- 交点采用**半开边规则**（`min(y1,y2) <= y < max(y1,y2)`，水平边跳过）：
+  扫描线经过顶点时该顶点恰好被两条邻边中的一条计数，局部极值点计 0 或 2 次，
+  **不会重复计数**；
+- 全部交点按 x 排序后两两配对，穿越一次切换一次填充状态，等价于按包含层级
+  **交替合并外环、孔与岛**（深度 0、2 …填充，1、3 …留空）；
+- 曲线（贝塞尔/椭圆弧）按与 normalize / metrics / clearance 相同的细分折线
+  求交；轮廓相切/尖点产生的零宽区间自动丢弃。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `spacing` | number | 扫描线纵向间距，必须 **> 0**（NaN/无穷/非数字返回 `422`） |
+
+**单次最多 1000 条**扫描线；按当前间距将生成更多时返回 `422`，请增大 `spacing`。
+
+```bash
+# 外方 0..10、内孔 1..9、孔中岛 6..8
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M1,1h8v8h-8Z M6,6h2v2h-2Z"
+}'
+curl -s -X POST localhost:8000/paths/1/scanlines \
+  -H 'Content-Type: application/json' \
+  -d '{"spacing": 2.5}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "spacing": 2.5,
+  "line_count": 4,
+  "lines": [
+    {"y": 0.0, "intervals": [[0.0, 10.0]]},
+    {"y": 2.5, "intervals": [[0.0, 1.0], [9.0, 10.0]]},
+    {"y": 5.0, "intervals": [[0.0, 1.0], [9.0, 10.0]]},
+    {"y": 7.5, "intervals": [[0.0, 1.0], [6.0, 8.0], [9.0, 10.0]]}
+  ],
+  "skipped_contours": []
+}
+```
+
+- `lines[]` 按 y 升序；`lines[]` 首项的 `y` 即整体包围盒最小 y，
+  最大 y 不出现在结果中；位于空带（上下分离轮廓之间）的扫描线仍会输出，
+  其 `intervals` 为空数组；
+- `intervals` 每项为 `[x_start, x_end]`，按 x **升序、互不重叠**；
+- **无有效闭合轮廓**（空路径、仅开放/退化轮廓）时 `lines` 为空列表、
+  `line_count` 为 `0`；
+- `skipped_contours[]`：被跳过的轮廓及 `reason`（`open` / `degenerate`）；
+- 路径不存在返回 `404`，`spacing` 缺失/≤0/非有限数或扫描线超 1000 条
+  返回 `422`，已存路径无法解析返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -393,7 +458,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 104 passed
+pytest -q          # 135 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -407,7 +472,12 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 安全间隙的点/线段距离原语（相交、零长度段）、孔-直接 parent 标记、
 同级孔与隔层 island 不标记、**距离等于阈值通过**、开放轮廓默认跳过与
 `include_open` 纳入、退化轮廓始终跳过、曲线细分、包围盒剔除、结果确定性与
-只读不落库、404/非法参数 422 等。
+只读不落库、404/非法参数 422 等；
+扫描线取线范围（最小 y 起、最大 y 不含）与等间距计数、半开边规则在顶点/
+底边/尖点处不重复计数（零宽区间丢弃）、外-孔-岛及四层嵌套交替合并、
+左右分离外环多区间、曲线细分截宽、开放与退化轮廓跳过、空路径返回空列表、
+1000 条上限边界（恰 1000 接受、超限 422）、非法 spacing 422、结果确定性、
+只读不落库与 404/脏数据 422 等。
 
 ## 数据存储
 
